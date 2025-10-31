@@ -1,0 +1,137 @@
+import os
+import certifi
+import sqlite3
+import time
+import threading
+import asyncio
+from pyrogram import Client, errors
+import telebot
+from telebot import types
+
+# إعدادات الاتصال
+api_id = 7911488845
+api_hash = "f75fe6157dd68bdf0df5198adbc590fd"
+TELEGRAM_TOKEN = "7966240362:AAGEz1SdchbTAg2vZcjTwip22_B7xGIEf64"
+os.environ['SSL_CERT_FILE'] = certifi.where()
+
+# إنشاء قاعدة البيانات
+if not os.path.isfile("data.db"):
+    with sqlite3.connect("data.db") as connection:
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS accounts (ses TEXT, number TEXT, id TEXT)")
+        connection.commit()
+
+# دوال قاعدة البيانات
+def add_account(ses, number, user_id):
+    with sqlite3.connect("data.db") as connection:
+        cursor = connection.cursor()
+        cursor.execute("INSERT INTO accounts VALUES (?, ?, ?)", (ses, number, user_id))
+        connection.commit()
+
+def get_accounts():
+    with sqlite3.connect("data.db") as connection:
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM accounts")
+        return cursor.fetchall()
+
+# دوال نقل الأعضاء
+def get_users(from_group):
+    users = []
+    try:
+        client = Client("session", api_id=api_id, api_hash=api_hash)
+        client.start()
+        for member in client.get_chat_members(from_group):
+            users.append(member.user.id)
+            time.sleep(1)
+        client.stop()
+    except Exception as e:
+        print("خطأ في get_users:", e)
+    return users
+
+def add_users(users, to_group, chat_id, bot):
+    try:
+        client = Client("session", api_id=api_id, api_hash=api_hash)
+        client.start()
+        for user_id in users:
+            try:
+                client.add_chat_members(to_group, user_id)
+                time.sleep(1)
+            except Exception as e:
+                print("خطأ في إضافة عضو:", e)
+        client.stop()
+        bot.send_message(chat_id, "✅ تم نقل الأعضاء بنجاح")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ فشل النقل: {e}")
+
+# تشغيل البوت
+bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False, num_threads=55, skip_pending=True)
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("نقل اعضاء 👤", callback_data="transfer"),
+        types.InlineKeyboardButton("اضافة حساب 🛎", callback_data="add"),
+        types.InlineKeyboardButton("عرض الحسابات 🖲", callback_data="show")
+    )
+    bot.send_message(message.chat.id, "مرحبا بك 👋 اختر من الأزرار أدناه:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    if call.data == "show":
+        accounts = get_accounts()
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              text=f"عدد الحسابات المسجلة: {len(accounts)}")
+    elif call.data == "add":
+        msg = bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                    text="أرسل رقم الهاتف مع رمز الدولة 📞")
+        bot.register_next_step_handler(msg, handle_phone)
+    elif call.data == "transfer":
+        msg = bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                    text="أرسل رابط الجروب المراد النقل منه 🖲")
+        bot.register_next_step_handler(msg, get_from_group)
+
+def handle_phone(message):
+    phone = message.text
+    bot.send_message(message.chat.id, "جاري إرسال الكود...")
+    client = Client("::memory::", api_id=api_id, api_hash=api_hash, in_memory=True)
+    client.connect()
+    try:
+        sent = client.send_code(phone)
+        msg = bot.send_message(message.chat.id, "أدخل الكود المرسل إليك 🔏")
+        bot.register_next_step_handler(msg, handle_code, client, phone, sent.phone_code_hash)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"خطأ: {e}")
+
+def handle_code(message, client, phone, code_hash):
+    try:
+        client.sign_in(phone, code_hash, message.text)
+        session = client.export_session_string()
+        add_account(session, phone, message.chat.id)
+        bot.send_message(message.chat.id, "✅ تم إضافة الحساب بنجاح")
+    except errors.SessionPasswordNeeded:
+        msg = bot.send_message(message.chat.id, "أدخل كلمة المرور لحسابك 🔐")
+        bot.register_next_step_handler(msg, handle_password, client, phone)
+
+def handle_password(message, client, phone):
+    try:
+        client.check_password(message.text)
+        session = client.export_session_string()
+        add_account(session, phone, message.chat.id)
+        bot.send_message(message.chat.id, "✅ تم تأكيد الحساب بنجاح")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"خطأ: {e}")
+
+def get_from_group(message):
+    from_group = message.text
+    msg = bot.send_message(message.chat.id, "أرسل رابط الجروب المراد النقل إليه 🛎")
+    bot.register_next_step_handler(msg, get_to_group, from_group)
+
+def get_to_group(message, from_group):
+    to_group = message.text
+    bot.send_message(message.chat.id, "جاري جمع الأعضاء...")
+    users = get_users(from_group)
+    bot.send_message(message.chat.id, f"تم جمع {len(users)} عضو ✅ جاري النقل...")
+    threading.Thread(target=asyncio.run, args=(add_users(users, to_group, message.chat.id, bot),)).start()
+
+bot.infinity_polling()
